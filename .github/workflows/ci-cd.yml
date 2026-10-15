@@ -3,11 +3,13 @@ name: CloudDrop CI/CD
 on:
   push:
     branches: [main]
+
   pull_request:
     branches: [main]
+
   workflow_dispatch:
 
-# Cancel an older run on the same branch/PR when a newer commit is pushed
+# Cancel an older run on the same branch/PR when a newer commit is pushed.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,9 +18,13 @@ permissions:
   contents: read
 
 jobs:
+  # -----------------------------------------------
+  # CI: Lint
+  # -----------------------------------------------
   lint:
     name: Lint
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -35,17 +41,21 @@ jobs:
       - name: Run ESLint
         run: npm run lint
 
+  # -----------------------------------------------
+  # CI: Test
+  # -----------------------------------------------
   test:
-    name: Test (Node ${{ matrix.node-version }})
+    name: Test (Node 22)
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js ${{ matrix.node-version }}
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
@@ -54,4 +64,125 @@ jobs:
       - name: Run tests
         run: npm test
 
-  # CD jobs (deploy) will be added here later with `needs: [lint, test, security, smoke]`
+  # -----------------------------------------------
+  # Build the deployment artifact
+  # Runs only after lint and tests pass.
+  # -----------------------------------------------
+  package:
+    name: Package Application
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create deployment package
+        run: |
+          tar -czf app.tar.gz \
+            --exclude='./.git' \
+            --exclude='./.github' \
+            --exclude='./node_modules' \
+            --exclude='./coverage' \
+            --exclude='./.env' \
+            --exclude='./.env.*' \
+            .
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-drop
+          path: app.tar.gz
+          retention-days: 1
+
+  # -----------------------------------------------
+  # CD: Deploy to Ubuntu EC2
+  # -----------------------------------------------
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+
+    needs: [package]
+
+    # Deploy only from main, never from pull requests.
+    # Manual deployment is also allowed when workflow_dispatch
+    # is run against main.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch')
+
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-drop
+
+      # Configure SSH authentication and host verification.
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          set -e
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      # Transfer the artifact to EC2.
+      - name: Transfer package to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -e
+
+          scp \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            app.tar.gz \
+            "$EC2_USER@$EC2_HOST:/tmp/cloud-drop.tar.gz"
+
+      # Install production dependencies and restart the application.
+      - name: Deploy application
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -e
+
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" 'bash -se' <<'REMOTE'
+            set -e
+
+            APP_DIR="/var/www/cloud-drop"
+            ARCHIVE="/tmp/cloud-drop.tar.gz"
+
+            mkdir -p "$APP_DIR"
+
+            tar -xzf "$ARCHIVE" -C "$APP_DIR"
+
+            cd "$APP_DIR"
+
+            npm ci --omit=dev
+
+            if pm2 describe cloud-drop >/dev/null 2>&1; then
+              pm2 restart cloud-drop --update-env
+            else
+              pm2 start npm --name cloud-drop -- start
+            fi
+
+            pm2 save
+
+            rm -f "$ARCHIVE"
+
+            echo "CloudDrop deployment completed successfully."
+          REMOTE
